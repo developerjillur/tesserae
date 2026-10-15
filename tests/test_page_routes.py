@@ -2228,3 +2228,39 @@ def test_create_form_sits_behind_new_dashboard(app: Flask) -> None:
     assert 'id="dash-create" data-create-panel>' in client.get("/pages?create=1").get_data(
         as_text=True
     )
+
+
+def test_editor_panel_preview_urls_match_each_html_group(app: Flask) -> None:
+    """Panel PNGs must request the same dimensions as their adjacent HTML frames."""
+    import re
+    from dataclasses import replace
+    from html import unescape
+    from urllib.parse import parse_qs, urlsplit
+
+    from app.state.page_store import Page
+
+    devices = app.config["DEVICE_REGISTRY"]
+    kind = devices.get("esp32_client")
+    assert kind is not None
+    for did, w, h in (("large", 1200, 1600), ("small", 800, 480)):
+        devices.devices[did] = replace(
+            kind,
+            id=did,
+            kind_of=kind.id,
+            manifest={**kind.manifest, "name": did, "panel": {"w": w, "h": h}},
+        )
+    app.config["PAGE_STORE"].save(Page(id="mixed", name="Mixed", device_ids=["large", "small"]))
+    client = app.test_client()
+    _sign_in(client)
+    resp = client.get("/pages/mixed")
+    assert resp.status_code == 200
+    html = resp.get_data(as_text=True)
+    panel_urls = re.findall(r'data-panel-src="([^"]+)"', html)
+    iframe_urls = re.findall(r'<iframe src="([^"]+)"', html)
+    panel_sizes = [parse_qs(urlsplit(unescape(url)).query) for url in panel_urls]
+    html_sizes = [parse_qs(urlsplit(unescape(url)).query) for url in iframe_urls]
+    assert (
+        [(g["w"], g["h"]) for g in panel_sizes]
+        == [(g["w"], g["h"]) for g in html_sizes]
+        == [(["1200"], ["1600"]), (["800"], ["480"])]
+    )

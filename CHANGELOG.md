@@ -191,6 +191,11 @@ All notable changes to Tesserae are recorded here. Format loosely follows
 
 ### Fixed
 
+- **Panel view matches each preview group's full resolution** (#364). Large
+  panels no longer render widgets at the hover thumbnail's reduced size, and
+  dashboards bound to differently sized panels keep a separate preview for
+  each group.
+
 - **A page's Auto-update lands on the clock.** A page refreshing every N
   minutes now renders once per N-minute slot of the wall clock, just after it
   starts, and the scheduler checks on the clock rather than 30 s after its

@@ -816,11 +816,11 @@ def test_compose_panel_preview_quantises_existing_composition(
 
     page = Page(id="pg", name="Grid", layout_kind="grid")
     app.config["PAGE_STORE"].save(page)
-    width, height = composer.preview_dims(
+    width, height = composer._composition_dims(
         page, app.config.get("DEVICE_REGISTRY"), app.config["SETTINGS_STORE"]
     )
     token = composer.page_preview_token(page, (width, height))
-    cache_dir = app.config["DATA_ROOT"] / "core" / "previews"
+    cache_dir = app.config["DATA_ROOT"] / "core" / "previews" / "panel" / f"{width}x{height}"
     cache_dir.mkdir(parents=True, exist_ok=True)
     buf = io.BytesIO()
     Image.new("RGB", (24, 18), (123, 200, 60)).save(buf, "PNG")
@@ -849,6 +849,136 @@ def test_compose_panel_preview_202_when_composition_missing(
     app.config["PAGE_STORE"].save(Page(id="pg2", name="Grid", layout_kind="grid"))
     resp = app.test_client().get("/compose/pg2/panel.png")
     assert resp.status_code == 202
+
+
+def _bind_preview_panels(app: Flask, page: Any, sizes: list[tuple[int, int]]) -> None:
+    from dataclasses import replace
+
+    devices = app.config["DEVICE_REGISTRY"]
+    kind = devices.get("esp32_client")
+    assert kind is not None
+    ids = []
+    for index, (width, height) in enumerate(sizes):
+        did = f"panel_{index}"
+        ids.append(did)
+        devices.devices[did] = replace(
+            kind,
+            id=did,
+            kind_of=kind.id,
+            manifest={**kind.manifest, "name": did, "panel": {"w": width, "h": height}},
+        )
+    page.device_ids = ids
+    app.config["PAGE_STORE"].save(page)
+
+
+@pytest.mark.parametrize("width,height", [(1200, 1600), (1600, 1200), (800, 480)])
+def test_compose_panel_preview_uses_group_dimensions(
+    app: Flask, monkeypatch: pytest.MonkeyPatch, width: int, height: int
+) -> None:
+    """Panel view renders at the HTML group's size, not the hover thumbnail's."""
+    from app.state.page_store import Page
+
+    _bind_preview_panels(app, Page(id="large", name="Large"), [(1200, 1600), (width, height)])
+    calls: list[dict[str, Any]] = []
+    monkeypatch.setattr("app.preview_cache.submit", lambda **kw: calls.append(kw))
+    resp = app.test_client().get(f"/compose/large/panel.png?w={width}&h={height}")
+    assert resp.status_code == 202
+    assert resp.headers["Cache-Control"] == "no-store"
+    assert (calls[0]["width"], calls[0]["height"]) == (width, height)
+
+
+def test_compose_panel_preview_default_and_invalid_dimensions(
+    app: Flask, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Invalid overrides fall back; unconfigured sizes cannot allocate full PNGs."""
+    from app.state.page_store import Page, Panel
+    from app.state.panel_store import CanvasLayout
+
+    page = Page(id="large", name="Large", panel=Panel(w=1200, h=1600))
+    app.config["PAGE_STORE"].save(page)
+    calls: list[dict[str, Any]] = []
+    monkeypatch.setattr("app.preview_cache.submit", lambda **kw: calls.append(kw))
+    client = app.test_client()
+    for query in ("", "?w=800", "?h=480", "?w=nope&h=480", "?w=0&h=480", "?w=-1&h=480"):
+        assert client.get(f"/compose/large/panel.png{query}").status_code == 202
+        assert (calls[-1]["width"], calls[-1]["height"]) == (1200, 1600)
+    submitted = len(calls)
+    for query in ("?w=10000&h=10000", "?w=10001&h=1200", "?w=1201&h=1600"):
+        assert client.get(f"/compose/large/panel.png{query}").status_code == 400
+    assert len(calls) == submitted
+    assert not (app.config["DATA_ROOT"] / "core" / "previews").exists()
+
+    # Clamping must not turn an unconfigured request into an allowed one.
+    app.config["PAGE_STORE"].save(Page(id="limit", name="Limit", panel=Panel(w=10000, h=1200)))
+    assert client.get("/compose/limit/panel.png?w=10001&h=1200").status_code == 400
+    assert len(calls) == submitted
+
+    app.config["PAGE_STORE"].save(
+        Page(
+            id="pg_canvas", name="Canvas", layout_kind="canvas", canvas=CanvasLayout(w=900, h=1500)
+        )
+    )
+    assert client.get("/compose/pg_canvas/panel.png").status_code == 202
+    assert (calls[-1]["width"], calls[-1]["height"]) == (900, 1500)
+    # Hover thumbnails retain their existing cap.
+    assert composer.preview_dims(page, None, app.config["SETTINGS_STORE"]) == (600, 800)
+
+
+def test_compose_panel_preview_groups_keep_separate_caches(
+    app: Flask, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Mixed-size panel previews and the hover thumbnail must not evict one another."""
+    import io
+
+    from PIL import Image
+
+    from app import preview_cache
+    from app.state.page_store import Page
+
+    page = Page(id="mixed", name="Mixed")
+    _bind_preview_panels(app, page, [(1200, 1600), (800, 480)])
+    calls: list[tuple[int, int]] = []
+
+    def render(req: Any, pool: Any = None) -> bytes:
+        dims = (req.viewport_w, req.viewport_h)
+        calls.append(dims)
+        assert f"?w={dims[0]}&h={dims[1]}" in req.url
+        buf = io.BytesIO()
+        Image.new("RGB", dims, "white").save(buf, "PNG")
+        return buf.getvalue()
+
+    monkeypatch.setattr("app.renderer.render_to_png", render)
+    client = app.test_client()
+    urls = [
+        "/compose/mixed/panel.png?w=1200&h=1600&dither=none",
+        "/compose/mixed/panel.png?w=800&h=480&dither=none",
+        "/compose/mixed/preview.png",
+    ]
+    sizes = [(1200, 1600), (800, 480), (600, 800)]
+    etags: list[str] = []
+    for url, size in zip(urls, sizes, strict=True):
+        assert client.get(url).status_code == 202
+        preview_cache.join()
+        resp = client.get(url)
+        assert resp.status_code == 200
+        assert Image.open(io.BytesIO(resp.data)).size == size
+        etags.append(resp.headers["ETag"])
+    assert calls == sizes
+    assert len(set(etags)) == 3
+    for url, etag in zip(urls, etags, strict=True):
+        assert client.get(url).status_code == 200
+        assert client.get(url, headers={"If-None-Match": etag}).status_code == 304
+    assert calls == sizes  # all three survive another group's render
+
+    # A draft edit still rotates each token and prunes old versions within its size.
+    app.config["PREVIEW_CACHE"] = {"mixed": page.model_copy(update={"theme": "dark"})}
+    for url, etag in zip(urls, etags, strict=True):
+        assert client.get(url).status_code == 202
+        preview_cache.join()
+        assert client.get(url).headers["ETag"] != etag
+    assert calls == sizes * 2
+    cache_dir = app.config["DATA_ROOT"] / "core" / "previews"
+    assert len(list(cache_dir.rglob("mixed__*.png"))) == 5  # 2 compositions + 2 panels + hover
 
 
 def test_compose_panel_preview_unknown_page_404(client: FlaskClient) -> None:

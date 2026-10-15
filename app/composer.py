@@ -39,7 +39,12 @@ from app import widget_next_change
 from app.bindings import apply_binding
 from app.locale_resolve import resolve_locale
 from app.location_time import is_iana_zone
-from app.panel import PANEL_PRESETS, panel_groups_for_push, resolve_panel_for_page
+from app.panel import (
+    PANEL_PRESETS,
+    panel_groups_for_push,
+    preview_groups_for_page,
+    resolve_panel_for_page,
+)
 from app.plugin_http import fetch_json
 from app.plugin_loader import Font, PluginRegistry
 from app.state.page_store import Page, PageStore
@@ -1750,11 +1755,8 @@ def _preview_timezone_id() -> str | None:
         return None
 
 
-def preview_dims(page: Page, devices: Any, settings_store: Any) -> tuple[int, int]:
-    """The dims to render a dashboard's hover preview at: its panel (or an
-    unbound canvas's authored size), scaled so the longest side is
-    ``PREVIEW_MAX_DIM`` with the aspect preserved. Mirrors ``compose``'s dim
-    logic so the preview matches what a push would look like."""
+def _composition_dims(page: Page, devices: Any, settings_store: Any) -> tuple[int, int]:
+    """Full render size, matching compose's panel or unbound canvas fallback."""
     cv = (
         page.canvas
         if (page.layout_kind == "canvas" and page.canvas and not page.device_ids)
@@ -1765,7 +1767,12 @@ def preview_dims(page: Page, devices: Any, settings_store: Any) -> tuple[int, in
     else:
         panel = resolve_panel_for_page(page, devices, settings_store)
         pw, ph = int(panel.w), int(panel.h)
-    pw, ph = max(1, pw), max(1, ph)
+    return max(1, pw), max(1, ph)
+
+
+def preview_dims(page: Page, devices: Any, settings_store: Any) -> tuple[int, int]:
+    """Hover-thumbnail dims, capped at ``PREVIEW_MAX_DIM`` with aspect preserved."""
+    pw, ph = _composition_dims(page, devices, settings_store)
     longest = max(pw, ph)
     if longest > PREVIEW_MAX_DIM:
         scale = PREVIEW_MAX_DIM / longest
@@ -1896,12 +1903,15 @@ def compose_panel_preview(page_id: str) -> Response:
     device's palette, so the editor can show the exact per-pixel output the e-ink
     panel paints rather than the full-colour composition.
 
-    Reuses the same rendered composition as ``preview.png`` (returning ``202``
-    while that render is in flight), then runs it through the quantiser.
+    Renders at the HTML preview group's full ``?w=&h=`` dimensions (or the
+    page's resolved size), returning ``202`` while that render is in flight.
+    Explicit dimensions must match a configured preview group. The composition
+    then runs through the quantiser. Hover thumbnails are kept separate:
+    rendering at their reduced size changes widget layout and icon sizing.
     ``?device=<id>`` selects the panel's gamut (falls back to the page's first
     bound device, then 6-colour Spectra); ``?dither=<mode>`` overrides the dither
     (default floyd-steinberg). The quantised result is cached per
-    (token, gamut, dither)."""
+    (dimensions, token, gamut, dither)."""
     from typing import cast, get_args
 
     from app.panel import device_panel
@@ -1913,7 +1923,19 @@ def compose_panel_preview(page_id: str) -> Response:
         abort(404)
     devices = current_app.config.get("DEVICE_REGISTRY")
     settings_store = current_app.config["SETTINGS_STORE"]
-    width, height = preview_dims(page, devices, settings_store)
+    width, height = _composition_dims(page, devices, settings_store)
+    override = _panel_override(request.args.get("w"), request.args.get("h"))
+    if override is not None:
+        # Full-resolution PNGs are only needed for configured preview groups.
+        # Arbitrary query sizes would allow huge renders and unbounded cache
+        # directories; reject them before submitting any background work.
+        allowed_dims = {(width, height)} | {
+            (g["w"], g["h"]) for g in preview_groups_for_page(page, devices, settings_store)
+        }
+        requested_dims = (int(request.args["w"]), int(request.args["h"]))
+        if requested_dims != override or override not in allowed_dims:
+            abort(400, description="Dimensions must match a configured preview group")
+        width, height = override
     token = page_preview_token(page, (width, height))
 
     # An explicit ?gamut wins (the editor passes the preview group's gamut);
@@ -1937,13 +1959,17 @@ def compose_panel_preview(page_id: str) -> Response:
     if dither not in get_args(DitherMode):
         dither = "floyd-steinberg"
 
-    cache_dir = Path(current_app.config["DATA_ROOT"]) / "core" / "previews"
+    # The render queue prunes old page versions within its cache directory.
+    # Isolate sizes so one preview group cannot evict another or the hover PNG.
+    cache_dir = (
+        Path(current_app.config["DATA_ROOT"]) / "core" / "previews" / "panel" / f"{width}x{height}"
+    )
     comp_path = cache_dir / f"{page_id}__{token}.png"
     if not comp_path.exists():
         from app import preview_cache
 
         preview_cache.submit(
-            key=f"{page_id}__{token}",
+            key=f"panel__{page_id}__{token}",
             base_url=request.host_url.rstrip("/"),
             page_id=page_id,
             width=width,

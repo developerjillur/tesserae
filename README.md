@@ -72,6 +72,10 @@ load the **same URL**: a headless Chromium (Playwright) screenshots the
 composition at panel resolution, so "looked fine in the editor, broke on
 the panel" is impossible by construction.
 
+In the grid editor's live preview, **HTML view** shows the full-colour
+composition and **Panel view** shows it quantised and dithered to the panel's
+palette. Both views use each preview group's full panel dimensions.
+
 The frame then goes through a per-device renderer: Floyd-Steinberg
 dithering against the panel's **measured** color palette (Spectra 6 and
 ACeP panels don't actually produce sRGB primaries; calibrated
